@@ -9,14 +9,17 @@
   * RGB565 pixels go out high byte first.
   *
   * All pixels of one window are sent in ONE frame (chip select stays low for
-  * the whole stream), which is what the panel expects. The data is pushed
-  * into the OCTOSPI FIFO by polling; if the CPU is late the peripheral simply
-  * pauses the clock.
+  * the whole stream), which is what the panel expects. Inside that frame the
+  * data is fed to the OCTOSPI FIFO by GPDMA1 channel 0 in blocks (very short
+  * pieces are pushed by polling). A DMA block runs in the background: the
+  * driver returns while it is still going out and waits for it at the start
+  * of the next driver call.
   */
 #include "co5300.h"
 #include <string.h>
 
 extern OSPI_HandleTypeDef hospi1;
+extern DMA_HandleTypeDef  handle_GPDMA1_Channel0;
 
 /* QSPI instruction codes */
 #define QSPI_INST_WRITE         0x02U
@@ -51,6 +54,14 @@ extern OSPI_HandleTypeDef hospi1;
 static uint16_t s_txBuf[TX_BUF_PIXELS];
 static uint32_t s_pendingBytes;         /* pixel bytes the current window still takes */
 static bool     s_frameOpen;            /* a pixel frame is in progress (CS low) */
+static bool     s_dmaActive;            /* a DMA block is still being sent */
+
+/* Pieces shorter than this are not worth a DMA start */
+#define DMA_MIN_BYTES           32U
+/* Largest DMA block (the GPDMA block counter is 16 bit); multiple of 4 */
+#define DMA_MAX_BYTES           0xFFFCU
+
+static HAL_StatusTypeDef DmaWait(void);
 
 static HAL_StatusTypeDef StreamAbort(void);
 
@@ -62,6 +73,7 @@ static HAL_StatusTypeDef QspiCommand(uint8_t instruction, uint8_t cmd, uint32_t 
 {
   OSPI_RegularCmdTypeDef c = {0};
 
+  (void)DmaWait();
   if (s_frameOpen)
   {
     (void)StreamAbort();   /* previous window was not filled completely */
@@ -190,17 +202,78 @@ static HAL_StatusTypeDef StreamEnd(void)
 
 static HAL_StatusTypeDef StreamAbort(void)
 {
+  if (s_dmaActive)
+  {
+    CLEAR_BIT(hospi1.Instance->CR, OCTOSPI_CR_DMAEN);
+    (void)HAL_DMA_Abort(&handle_GPDMA1_Channel0);
+    s_dmaActive = false;
+  }
   s_frameOpen    = false;
   s_pendingBytes = 0U;
   hospi1.State   = HAL_OSPI_STATE_BUSY_TX;   /* lets HAL_OSPI_Abort() do its work */
   return HAL_OSPI_Abort(&hospi1);
 }
 
-/* Send wire-order bytes belonging to the current window. */
+/* Start one DMA block of the open frame; returns while it is running. */
+static HAL_StatusTypeDef DmaStart(const uint8_t *data, uint32_t len)
+{
+  DMA_HandleTypeDef *hdma = &handle_GPDMA1_Channel0;
+  HAL_StatusTypeDef st;
+
+  /* Memory -> OCTOSPI data register, byte wide, whatever CubeMX configured */
+  MODIFY_REG(hdma->Instance->CTR1,
+             DMA_CTR1_SINC | DMA_CTR1_DINC | DMA_CTR1_SDW_LOG2 | DMA_CTR1_DDW_LOG2,
+             DMA_SINC_INCREMENTED | DMA_DINC_FIXED | DMA_SRC_DATAWIDTH_BYTE | DMA_DEST_DATAWIDTH_BYTE);
+  MODIFY_REG(hdma->Instance->CTR2, DMA_CTR2_DREQ, DMA_MEMORY_TO_PERIPH);
+
+  st = HAL_DMA_Start(hdma, (uint32_t)data, (uint32_t)&hospi1.Instance->DR, len);
+  if (st == HAL_OK)
+  {
+    SET_BIT(hospi1.Instance->CR, OCTOSPI_CR_DMAEN);
+    s_dmaActive = true;
+  }
+  return st;
+}
+
+/* Wait for the running DMA block; closes the frame if it was the last one. */
+static HAL_StatusTypeDef DmaWait(void)
+{
+  HAL_StatusTypeDef st;
+
+  if (!s_dmaActive)
+  {
+    return HAL_OK;
+  }
+
+  st = HAL_DMA_PollForTransfer(&handle_GPDMA1_Channel0, HAL_DMA_FULL_TRANSFER, CO5300_TIMEOUT_MS);
+  CLEAR_BIT(hospi1.Instance->CR, OCTOSPI_CR_DMAEN);
+  s_dmaActive = false;
+
+  if (st != HAL_OK)
+  {
+    (void)HAL_DMA_Abort(&handle_GPDMA1_Channel0);
+    (void)StreamAbort();
+    return st;
+  }
+  if (s_frameOpen && (s_pendingBytes == 0U))
+  {
+    st = StreamEnd();
+  }
+  return st;
+}
+
+/* Send wire-order bytes belonging to the current window. With DMA the last
+   block is still running when this returns: 'data' must stay untouched until
+   DmaWait() (called at the start of every driver function). */
 static HAL_StatusTypeDef WriteWindowBytes(const uint8_t *data, uint32_t len)
 {
-  HAL_StatusTypeDef st = HAL_OK;
+  HAL_StatusTypeDef st;
 
+  st = DmaWait();
+  if (st != HAL_OK)
+  {
+    return st;
+  }
   if ((len == 0U) || (len > s_pendingBytes))
   {
     return HAL_ERROR;   /* more data than the window holds, or no window set */
@@ -209,19 +282,42 @@ static HAL_StatusTypeDef WriteWindowBytes(const uint8_t *data, uint32_t len)
   {
     st = StreamBegin(s_pendingBytes);
   }
-  if (st == HAL_OK)
+
+  while ((len > 0U) && (st == HAL_OK))
   {
-    st = StreamPush(data, len);
+    uint32_t n = (len > DMA_MAX_BYTES) ? DMA_MAX_BYTES : len;
+
+    if ((CO5300_USE_DMA != 0) && (n >= DMA_MIN_BYTES))
+    {
+      st = DmaStart(data, n);
+      if (st == HAL_OK)
+      {
+        s_pendingBytes -= n;
+        if (len > n)
+        {
+          st = DmaWait();   /* more to come: this block has to finish first */
+        }
+      }
+    }
+    else
+    {
+      st = StreamPush(data, n);
+      if (st == HAL_OK)
+      {
+        s_pendingBytes -= n;
+        if (s_pendingBytes == 0U)
+        {
+          st = StreamEnd();
+        }
+      }
+    }
+    data += n;
+    len  -= n;
   }
+
   if (st != HAL_OK)
   {
     (void)StreamAbort();
-    return st;
-  }
-  s_pendingBytes -= len;
-  if (s_pendingBytes == 0U)
-  {
-    st = StreamEnd();
   }
   return st;
 }
@@ -266,6 +362,7 @@ HAL_StatusTypeDef CO5300_WritePixels(const uint16_t *pixels, uint32_t count)
   {
     uint32_t n = (count > TX_BUF_PIXELS) ? TX_BUF_PIXELS : count;
 
+    (void)DmaWait();   /* the scratch buffer may still be going out */
     for (uint32_t i = 0U; i < n; i++)
     {
       s_txBuf[i] = (uint16_t)__REV16(pixels[i]);
@@ -321,6 +418,7 @@ HAL_StatusTypeDef CO5300_FillRect(int32_t x, int32_t y, int32_t w, int32_t h, ui
   {
     return st;
   }
+  /* SetWindow waited for any running DMA block, the scratch buffer is free */
 
   count = (uint32_t)(x1 - x) * (uint32_t)(y1 - y);
   fill  = (count > TX_BUF_PIXELS) ? TX_BUF_PIXELS : count;
@@ -337,6 +435,16 @@ HAL_StatusTypeDef CO5300_FillRect(int32_t x, int32_t y, int32_t w, int32_t h, ui
     count -= n;
   }
   return st;
+}
+
+HAL_StatusTypeDef CO5300_WriteRaw(const uint8_t *wireBytes, uint32_t len)
+{
+  return WriteWindowBytes(wireBytes, len);
+}
+
+HAL_StatusTypeDef CO5300_WaitIdle(void)
+{
+  return DmaWait();
 }
 
 HAL_StatusTypeDef CO5300_FillScreen(uint16_t color)
@@ -419,6 +527,7 @@ static void BbClockPulse(void)
 
 void CO5300_ReadReg(uint8_t cmd, uint8_t *io0Data, uint8_t *io1Data, uint32_t len)
 {
+  (void)DmaWait();
   if (s_frameOpen)
   {
     (void)StreamAbort();

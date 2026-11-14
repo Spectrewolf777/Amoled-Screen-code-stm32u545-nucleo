@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include "co5300.h"
 #include "cst820.h"
+#include "ui.h"
 
 /* USER CODE END Includes */
 
@@ -64,8 +65,6 @@ static void MX_ICACHE_Init(void);
 static void MX_OCTOSPI1_Init(void);
 static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
-static void Demo_DrawTestPattern(void);
-static void Demo_PrintDisplayDiagnostics(void);
 
 /* USER CODE END PFP */
 
@@ -133,10 +132,13 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  static const uint8_t brightnessLevels[] = { 0x30U, 0xA0U, 0xFFU };
+  uint32_t brightnessIdx = 1U;
   bool touchOk;
-  bool wasPressed = false;
-  uint16_t lastX = 0U;
-  uint16_t lastY = 0U;
+  uint32_t nextFrame;
+  uint32_t statStart;
+  uint32_t statFrames = 0U;
+  uint32_t statPixels = 0U;
 
   printf("\r\n1.73\" AMOLED demo (CO5300 + CST820)\r\n");
 
@@ -145,73 +147,56 @@ int main(void)
     printf("CO5300 init failed (OCTOSPI error 0x%08lX)\r\n", (unsigned long)hospi1.ErrorCode);
     Error_Handler();
   }
-  /* Four full-screen colours, 2 s each, then the bars */
-  {
-    static const struct { uint16_t color; const char *name; } fills[] =
-    {
-      { CO5300_RED, "RED" }, { CO5300_GREEN, "GREEN" }, { CO5300_BLUE, "BLUE" }, { CO5300_WHITE, "WHITE" },
-    };
-
-    for (uint32_t i = 0U; i < (sizeof(fills) / sizeof(fills[0])); i++)
-    {
-      HAL_StatusTypeDef st = CO5300_FillScreen(fills[i].color);
-
-      printf("full screen %-5s -> status %d, OSPI error 0x%08lX\r\n",
-             fills[i].name, (int)st, (unsigned long)hospi1.ErrorCode);
-      HAL_Delay(2000U);
-    }
-  }
-  Demo_DrawTestPattern();
-  Demo_PrintDisplayDiagnostics();
+  (void)CO5300_SetBrightness(brightnessLevels[brightnessIdx]);
 
   touchOk = (CST820_Init() == HAL_OK);
-  if (touchOk)
-  {
-    uint8_t chipId = 0U;
+  printf(touchOk ? "CST820 touch found\r\n" : "CST820 touch not answering on I2C1\r\n");
+  printf("Tap the screen to switch between the watch face and the orbs.\r\n");
+  printf("On the orbs screen, hold a finger down to pull them. USER button: brightness.\r\n");
 
-    (void)CST820_ReadChipID(&chipId);
-    printf("CST820 found, chip ID 0x%02X\r\n", chipId);
-  }
-  else
-  {
-    printf("CST820 not answering on I2C1 (address 0x%02X)\r\n", CST820_I2C_ADDR);
-  }
-  printf("Running. Touch draws, USER button redraws the bars\r\n");
+  UI_Init(HAL_GetTick());
+  nextFrame = HAL_GetTick();
+  statStart = nextFrame;
 
   while (1)
   {
-    CST820_Touch touch;
+    CST820_Touch touch = {0};
+    uint32_t now;
+
+    /* pace the animation at about 30 frames per second */
+    while ((int32_t)(HAL_GetTick() - nextFrame) < 0)
+    {
+    }
+    now = HAL_GetTick();
+    nextFrame = now + 33U;
 
     if (s_buttonPressed != 0U)
     {
       s_buttonPressed = 0U;
-      Demo_DrawTestPattern();
-      printf("bars redrawn\r\n");
+      brightnessIdx = (brightnessIdx + 1U) % sizeof(brightnessLevels);
+      (void)CO5300_SetBrightness(brightnessLevels[brightnessIdx]);
+      printf("brightness 0x%02X\r\n", brightnessLevels[brightnessIdx]);
     }
 
-    if (touchOk && (CST820_Read(&touch) == HAL_OK))
+    if (touchOk)
     {
-      if (touch.pressed)
-      {
-        /* 6x6 dot centred on the finger */
-        (void)CO5300_FillRect((int32_t)touch.x - 3, (int32_t)touch.y - 3, 6, 6, CO5300_WHITE);
-        if (!wasPressed || (touch.x != lastX) || (touch.y != lastY))
-        {
-          printf("touch x=%3u y=%3u\r\n", touch.x, touch.y);
-          lastX = touch.x;
-          lastY = touch.y;
-        }
-        BSP_LED_On(LED_GREEN);
-      }
-      else if (wasPressed)
-      {
-        printf("release\r\n");
-        BSP_LED_Off(LED_GREEN);
-      }
-      wasPressed = touch.pressed;
+      (void)CST820_Read(&touch);
     }
+    UI_Frame(now, touch.pressed, touch.x, touch.y);
+    if (touch.pressed) { BSP_LED_On(LED_GREEN); } else { BSP_LED_Off(LED_GREEN); }
 
-    HAL_Delay(10U);
+    /* frame statistics every 5 s */
+    statFrames++;
+    statPixels += UI_LastFramePixels();
+    if ((HAL_GetTick() - statStart) >= 5000U)
+    {
+      printf("%lu.%lu fps, %lu pixels/frame\r\n",
+             (unsigned long)(statFrames / 5U), (unsigned long)((statFrames * 2U) % 10U),
+             (unsigned long)(statPixels / statFrames));
+      statFrames = 0U;
+      statPixels = 0U;
+      statStart = HAL_GetTick();
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -460,64 +445,6 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-/**
-  * @brief  Eight colour bars with a white frame line at the top and bottom
-  *         third, so that orientation, colour order and offsets can be checked.
-  */
-static void Demo_DrawTestPattern(void)
-{
-  static const uint16_t bars[8] =
-  {
-    CO5300_WHITE, CO5300_YELLOW, CO5300_CYAN, CO5300_GREEN,
-    CO5300_MAGENTA, CO5300_RED, CO5300_BLUE, CO5300_BLACK
-  };
-  const int32_t barW = (int32_t)(CO5300_WIDTH / 8U) & ~1;   /* even width */
-
-  for (int32_t i = 0; i < 8; i++)
-  {
-    int32_t x = i * barW;
-    int32_t w = (i == 7) ? ((int32_t)CO5300_WIDTH - x) : barW;
-
-    HAL_StatusTypeDef st = CO5300_FillRect(x, 0, w, (int32_t)CO5300_HEIGHT, bars[i]);
-
-    printf("bar %ld x=%3ld w=%2ld -> status %d, OSPI error 0x%08lX\r\n",
-           (long)i, (long)x, (long)w, (int)st, (unsigned long)hospi1.ErrorCode);
-  }
-  printf("white line -> status %d\r\n",
-         (int)CO5300_FillRect(0, (int32_t)CO5300_HEIGHT / 3, (int32_t)CO5300_WIDTH, 2, CO5300_WHITE));
-  printf("red line   -> status %d\r\n",
-         (int)CO5300_FillRect(0, 2 * (int32_t)CO5300_HEIGHT / 3, (int32_t)CO5300_WIDTH, 2, CO5300_RED));
-}
-
-/**
-  * @brief  Read a few CO5300 registers back and print what arrives on IO0 and
-  *         on IO1. Healthy panel after init: ID 33 1x 00, power mode 9C,
-  *         pixel format x5, brightness D0.
-  */
-static void Demo_PrintDisplayDiagnostics(void)
-{
-  static const struct { uint8_t cmd; uint8_t len; const char *name; } regs[] =
-  {
-    { 0x04U, 3U, "ID        " },
-    { 0x0AU, 1U, "power mode" },
-    { 0x0CU, 1U, "pixel fmt " },
-    { 0x52U, 1U, "brightness" },
-  };
-
-  for (uint32_t r = 0U; r < (sizeof(regs) / sizeof(regs[0])); r++)
-  {
-    uint8_t io0[3] = {0};
-    uint8_t io1[3] = {0};
-
-    CO5300_ReadReg(regs[r].cmd, io0, io1, regs[r].len);
-    printf("CO5300 %02Xh %s  IO0:", regs[r].cmd, regs[r].name);
-    for (uint32_t i = 0U; i < regs[r].len; i++) { printf(" %02X", io0[i]); }
-    printf("   IO1:");
-    for (uint32_t i = 0U; i < regs[r].len; i++) { printf(" %02X", io1[i]); }
-    printf("\r\n");
-  }
-}
-
 /**
   * @brief  USER button (EXTI) callback from the Nucleo BSP.
   */

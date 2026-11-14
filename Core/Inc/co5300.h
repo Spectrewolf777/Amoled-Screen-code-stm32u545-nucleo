@@ -68,6 +68,21 @@ HAL_StatusTypeDef CO5300_SetWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t 
 HAL_StatusTypeDef CO5300_WritePixels(const uint16_t *pixels, uint32_t count);
 
 /**
+  * Fastest path, for pixel data that is already in wire order (RGB565, high
+  * byte first; see CO5300_WIRE()). After CO5300_SetWindow() send exactly
+  * w*h*2 bytes in one or more calls.
+  * The data goes out by DMA in the background: the call returns immediately
+  * and the buffer must not be modified until the next driver call (which
+  * waits for it) or CO5300_WaitIdle() has returned. Rendering into a second
+  * buffer meanwhile is what makes this fast.
+  */
+HAL_StatusTypeDef CO5300_WriteRaw(const uint8_t *wireBytes, uint32_t len);
+HAL_StatusTypeDef CO5300_WaitIdle(void);
+
+/** RGB565 value as it has to sit in memory for CO5300_WriteRaw(). */
+#define CO5300_WIRE(c)          ((uint16_t)((((c) & 0xFFU) << 8) | (((c) >> 8) & 0xFFU)))
+
+/**
   * Diagnostic register read (e.g. 04h ID, 0Ah power mode, 52h brightness).
   * The CO5300 answers on SIO0, which the OCTOSPI peripheral cannot receive on
   * in 1-wire mode, so this temporarily takes over CS/CLK/IO0/IO1 as GPIOs and

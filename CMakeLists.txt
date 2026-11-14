@@ -47,7 +47,14 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Core/Src/co5300.c
     Core/Src/cst820.c
+    Core/Src/gfx.c
+    Core/Src/ui.c
 )
+
+# The pixel code is far too slow at -O0, so these files are always optimised,
+# also in Debug builds
+set_source_files_properties(Core/Src/co5300.c Core/Src/gfx.c Core/Src/ui.c
+    PROPERTIES COMPILE_OPTIONS "-O2")
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE

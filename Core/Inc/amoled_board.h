@@ -23,9 +23,13 @@
 #define AMOLED_COL_OFFSET       6U
 #define AMOLED_ROW_OFFSET       0U
 
-/* Brightness after CO5300_Init(), 0x00..0xFF. Kept low while the supply is
-   suspect: a bright full-screen image draws well over 100 mA. */
-#define AMOLED_DEFAULT_BRIGHTNESS   0x30U
+/* Brightness after CO5300_Init(), 0x00..0xFF. A bright, mostly white screen
+   draws well over 100 mA from the 3.3 V supply. */
+#define AMOLED_DEFAULT_BRIGHTNESS   0xA0U
+
+/* 1 = pixel data is fed to OCTOSPI1 by GPDMA1 channel 0 (normal),
+   0 = by CPU polling (slower; only useful to rule DMA out when debugging). */
+#define CO5300_USE_DMA          1
 
 /* ------------------------------------------------------- display GPIOs --- */
 /* QSPI pins, must match the OCTOSPI1 pinout in CubeMX. Only used by the
